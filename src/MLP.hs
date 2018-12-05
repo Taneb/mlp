@@ -5,16 +5,17 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE QuantifiedConstraints #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
-module MLP where
+module MLP (module MLP.Core, module MLP.Classes.FeedForward, module MLP.Classes.BackPropagate, module MLP) where
 
 import Control.Applicative
-import Control.Arrow (second)
 import Control.Category
 import Control.DeepSeq
+import Control.Exception (evaluate)
+import Control.Monad
 import Control.Monad.Primitive
+import Data.Foldable (toList)
 import Data.List (foldl')
 import GHC.TypeNats
 import Linear
@@ -24,50 +25,9 @@ import System.Random.MWC.Distributions
 
 import Prelude hiding ((.), id)
 
-infixr 1 `Cons`
-
-data Network c i o where
-  Nil :: Network c x x
-  Cons :: c l => l i m -> Network c m o -> Network c i o
-
-instance Category (Network c) where
-  id = Nil
-  x . Nil = x
-  x . Cons l y = Cons l (x . y)
-
-forget :: c l => l i o -> Network c i o
-forget l = Cons l Nil
-
-free :: Category k => (forall l i o. c l => l i o -> k i o) -> Network c i o -> k i o
-free f Nil = id
-free f (Cons l n) = free f n . f l
-
-class FeedForwardCPU l where
-  feedForwardCPU :: l i o -> V i Double -> V o Double
-
-newtype FFCPU i o = FFCPU {runFFCPU :: V i Double -> V o Double}
-
-instance Category FFCPU where
-  id = FFCPU id
-  FFCPU x . FFCPU y = FFCPU (x . y)
-
-instance (forall l. c l => FeedForwardCPU l) => FeedForwardCPU (Network c) where
-  feedForwardCPU = runFFCPU . free (FFCPU . feedForwardCPU)
-
-class FeedForwardCPU l => BackPropagateCPU l where
-  backPropagateCPU :: Double -> l i o -> (V i Double, V o Double) -> ((V o Double, V i Double), l i o)
-
-newtype BPCPU c i o = BPCPU {runBPCPU :: (V i Double, V o Double) -> ((V o Double, V i Double), Network c i o)}
-
-instance Category (BPCPU c) where
-  id = BPCPU $ \(i, o) -> ((o, i), id)
-  BPCPU f . BPCPU g = BPCPU $ \(ia, og) ->
-    let ((ma, ig), g') = g (ia, mg)
-        ((oa, mg), f') = f (ma, og)
-    in ((oa, ig), f' . g')
-
-instance (forall l. c l => BackPropagateCPU l) => BackPropagateCPU (Network c) where
-  backPropagateCPU learningRate = runBPCPU . free (\l -> BPCPU $ second forget . backPropagateCPU learningRate l)
+import MLP.Classes.BackPropagate
+import MLP.Classes.FeedForward
+import MLP.Core
 
 class RandomInitialize l where
   randomInitialize :: PrimMonad m => l i o -> Gen (PrimState m) -> m (l i o)
@@ -94,8 +54,10 @@ instance (forall l. c l => NormalFormNetwork l) => NormalFormNetwork (Network c)
   normalFormNetwork net = case free (\l -> normalFormNetwork l `seq` NFN) net of
     NFN -> ()
 
+-- Fully connected layers
+
 data FullyConnected i o where
-  FullyConnected :: (KnownNat i, KnownNat o) => { weights :: V o (V i Double) } -> FullyConnected i o
+  FullyConnected :: (KnownNat i, KnownNat o) => { weights :: V o (V i Double) } -> FullyConnected ('Tip '[i]) ('Tip '[o])
 
 instance FeedForwardCPU FullyConnected where
   feedForwardCPU (FullyConnected {weights}) v = weights !* v
@@ -111,35 +73,39 @@ instance RandomInitialize FullyConnected where
 instance NormalFormNetwork FullyConnected where
   normalFormNetwork FullyConnected {weights} = rnf weights
 
-data AddBiases i o where
-  AddBiases :: KnownNat x => { biases :: V x Double } -> AddBiases x x
+-- Add bias layers
 
-instance FeedForwardCPU AddBiases where
-  feedForwardCPU AddBiases {biases} v = v ^+^ biases
+data AddBias i o where
+  AddBias :: { bias :: Double } -> AddBias ('Tip '[]) ('Tip '[])
 
-instance BackPropagateCPU AddBiases where
-  backPropagateCPU learningRate AddBiases {biases} (ia, og) =
-    ((ia ^+^ biases, og), AddBiases {biases = biases + learningRate *^ og})
+instance FeedForwardCPU AddBias where
+  feedForwardCPU AddBias {bias} a = a + bias
 
-instance RandomInitialize AddBiases where
-  randomInitialize AddBiases {biases} gen = AddBiases <$> traverse (\_ -> standard gen) biases
+instance BackPropagateCPU AddBias where
+  backPropagateCPU learningRate AddBias {bias} (ia, og) =
+    ((ia + bias, og), AddBias {bias = bias + learningRate * og})
 
-instance NormalFormNetwork AddBiases where
-  normalFormNetwork AddBiases {biases} = rnf biases
+instance RandomInitialize AddBias where
+  randomInitialize AddBias {} gen = AddBias <$> standard gen 
+
+instance NormalFormNetwork AddBias where
+  normalFormNetwork AddBias {bias} = rnf bias
+
+-- Sigmoid layer
 
 data Sigmoid i o where
-  Sigmoid :: KnownNat x => Sigmoid x x
+  Sigmoid :: Sigmoid ('Tip '[]) ('Tip '[])
 
 sigmoidFunction :: Double -> Double
 sigmoidFunction x = 1/(1 + exp (negate x))
 
 instance FeedForwardCPU Sigmoid where
-  feedForwardCPU Sigmoid = fmap sigmoidFunction
+  feedForwardCPU Sigmoid = sigmoidFunction
 
 instance BackPropagateCPU Sigmoid where
   backPropagateCPU _ Sigmoid (ia, og) =
-    let oa = fmap sigmoidFunction ia
-        ig = fmap (\x -> sigmoidFunction x * (1 - sigmoidFunction x)) ia * og
+    let oa = sigmoidFunction ia
+        ig = sigmoidFunction ia * (1 - sigmoidFunction ia) * og
     in ((oa, ig), Sigmoid)
 
 instance RandomInitialize Sigmoid where
@@ -147,6 +113,28 @@ instance RandomInitialize Sigmoid where
 
 instance NormalFormNetwork Sigmoid where
   normalFormNetwork Sigmoid = ()
+
+-- Lift layers to higher dimension tensors
+
+data LiftLayer l i o where
+  LiftLayer :: KnownNat x => V x (l ('Tip i) ('Tip o)) -> LiftLayer l ('Tip (x ': i)) ('Tip (x ': o))
+
+instance FeedForwardCPU l => FeedForwardCPU (LiftLayer l) where
+  feedForwardCPU (LiftLayer l) = liftA2 feedForwardCPU l 
+
+instance BackPropagateCPU l => BackPropagateCPU (LiftLayer l) where
+  backPropagateCPU lr (LiftLayer l) (ia, og) =
+     let r = (curry . backPropagateCPU lr <$> l <*> ia <*> og)
+         oa = fst.fst <$> r
+         ig = snd.fst <$> r
+         l' = snd     <$> r
+     in ((oa, ig), LiftLayer l')
+
+instance RandomInitialize l => RandomInitialize (LiftLayer l) where
+  randomInitialize (LiftLayer l) gen = LiftLayer <$> traverse (\l' -> randomInitialize l' gen) l
+
+instance NormalFormNetwork l => NormalFormNetwork (LiftLayer l) where
+  normalFormNetwork (LiftLayer l) = liftRnf (normalFormNetwork) (toList l)
 
 -- training
 --
@@ -161,8 +149,8 @@ train
      )
   => [(V i Double, V o Double)]
   -> Double
-  -> Network c i o
-  -> Network c i o
+  -> Network c ('Tip '[i]) ('Tip '[o])
+  -> Network c ('Tip '[i]) ('Tip '[o])
 train dat learningRate n = foldl' trainExample' n dat
   where
     trainExample net (input, ref) = 
@@ -173,16 +161,3 @@ train dat learningRate n = foldl' trainExample' n dat
     trainExample' net ir =
       let net' = trainExample net ir
       in normalFormNetwork net' `seq` net'
-
-class (BackPropagateCPU l, NormalFormNetwork l, RandomInitialize l) => MNistC l
-instance (BackPropagateCPU l, NormalFormNetwork l, RandomInitialize l) => MNistC l
-
-mnist :: Network MNistC (28 GHC.TypeNats.* 28) 10
-mnist =
-  FullyConnected (pure (pure 0) :: V 15 (V 784 Double)) `Cons`
-  AddBiases (pure 0) `Cons`
-  Sigmoid `Cons`
-  FullyConnected (pure (pure 0)) `Cons`
-  AddBiases (pure 0) `Cons`
-  Sigmoid `Cons`
-  Nil
