@@ -17,9 +17,17 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     MLP
+                       MLP.Classes
                        MLP.Classes.BackPropagate
                        MLP.Classes.FeedForward
+                       MLP.Classes.RandomInitialize
+                       MLP.Classes.NormalForm
                        MLP.Core
+                       MLP.Layers
+                       MLP.Layers.AddBiases
+                       MLP.Layers.FullyConnected
+                       MLP.Layers.Sigmoid
+                       MLP.Layers.Lift
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base >=4.12 && <4.13
