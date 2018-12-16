@@ -24,8 +24,11 @@ library
                        MLP.Classes.NormalForm
                        MLP.Core
                        MLP.Layers
+                       MLP.Layers.Add
                        MLP.Layers.AddBiases
+                       MLP.Layers.Duplicate
                        MLP.Layers.FullyConnected
+                       MLP.Layers.Product
                        MLP.Layers.Sigmoid
                        MLP.Layers.Lift
   -- other-modules:       

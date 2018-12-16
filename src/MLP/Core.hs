@@ -14,6 +14,8 @@ import Linear.V
 
 import Prelude hiding ((.), id)
 
+-- TODO: use singletons for extracting dimensions as values
+
 -- | n-dimensional tensor with dimensions encoded in the type. Implemented as
 -- nested 'V's. First dimension listed is outermost.
 type family Tensor (dims :: [Nat]) :: * where
